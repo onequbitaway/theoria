@@ -1,0 +1,12 @@
+# Audit grader role config (claude default).
+# To grade on codex instead, set backend: codex (and search: true) here.
+#
+# Web search: claude has default tool access (including WebSearch /
+# WebFetch) when `tools` is unset, which is what we want. Codex opts in
+# explicitly via `search: true` in the codex override.
+
+audit_grader:
+  backend: claude
+  model: opus
+  effort: max
+  preamble: false

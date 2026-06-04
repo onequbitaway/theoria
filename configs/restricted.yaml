@@ -1,0 +1,18 @@
+# Only tools differ from defaults
+formalizer:
+  tools: "Bash,WebSearch,WebFetch"
+
+citation:
+  tools: "WebSearch,WebFetch"
+
+problem_given:
+  tools: ""
+
+computation:
+  tools: "Bash"
+
+initial_state:
+  tools: "WebSearch,WebFetch"
+
+convention_lift:
+  tools: "WebSearch,WebFetch"

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Run outputs — every invocation writes here; never commit results/artifacts
+runs/
+
+# Local databases / scratch
+*.db
+*.log
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+
+# Local Claude Code / tool settings (may contain machine-specific permissions)
+.claude/settings.local.json

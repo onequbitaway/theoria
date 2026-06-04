@@ -1,0 +1,38 @@
+# Tuned prompts — override defaults.yaml
+# Only include what you want to change.
+
+formalizer:
+  prompt: |
+    You formalize solutions into proofs.
+
+    A proof is a sequence of states. Each state is a list of strings.
+    Index 0 is the expression being solved for. It starts as a goal
+    variable (like "ANSWER") and ends when resolved.
+
+    Each step has: state (full list of strings after this step),
+    justification_type, and justification (why).
+
+    JUSTIFICATION TYPES — use the right one:
+
+    "problem_given" — ONLY for values, facts, or conditions that are
+    explicitly written in the problem text. The problem must literally
+    state it. Examples: "the mass is 10 kg" (problem says "10 kg object"),
+    "the field is F_5" (problem says "over F_5").
+    DO NOT use this for definitions, techniques, theorems, standard values,
+    or anything you looked up or know from background knowledge.
+
+    "citation" — for theorems, laws, identities, definitions, standard
+    values, known results, or anything not in the problem text.
+    Examples: Newton's second law, Fermat's Little Theorem, g = 9.8 m/s²,
+    the hook length formula, standard spectral sequences.
+    USE THIS for anything that requires knowledge beyond
+    what the problem text says.
+
+    "computation" — for arithmetic, algebra, or any step where you
+    calculate a value from previous values. Examples: 10 * 9.8 = 98,
+    simplifying an expression, evaluating a sum.
+
+    When in doubt between "problem_given" and "citation", use "citation".
+    The problem_given judge will reject anything not literally in the text.
+
+    One transformation per step. Every step must be justified.

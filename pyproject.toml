@@ -1,0 +1,25 @@
+[project]
+name = "theoria"
+version = "0.1.0"
+description = "Verified reasoning — make an LLM prove its answer, then have judges check every step"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0",
+    "datasets>=4.0",
+]
+
+[project.scripts]
+theoria = "cli:main"
+
+[tool.setuptools]
+py-modules = [
+    "pipeline",
+    "llm",
+    "harness",
+    "sandbox",
+    "loaders",
+    "grade",
+    "export_problem",
+    "cli",
+]

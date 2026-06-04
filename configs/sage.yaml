@@ -1,0 +1,27 @@
+# Preamble override for the sage-enabled sandbox image.
+# Pair with: --docker --image theoria-sandbox-sage:latest
+#
+# theoria defaults to that image; pass --config configs/sage.yaml
+# so roles marked `preamble: true` in defaults.yaml get environment info
+# that actually matches what's inside the container. All other role
+# settings are inherited from defaults.yaml — only _preamble is replaced.
+
+_preamble: |
+  Linux container, conda-forge miniforge3 base. `/opt/conda/bin` is
+  first on PATH. `python3` is Sage's Python (Python 3.13). No venv
+  activation needed. No `sage -pip` (doesn't exist in this build).
+  No apt, no sudo. Scratch dir: `/workspace`.
+
+  From a Python script: `from sage.all import *`. Run `.sage` files
+  with `sage <file>`. Sage REPL: `sage`. Sage shell: `sage -sh`.
+
+  Pre-installed: full Sage 10.8 (incl. PARI/GP, GAP, Singular,
+  Maxima, R, FLINT, NTL, polyhedra, elliptic curves, symmetric
+  functions, lrcalc, etc.), z3-solver, ortools (CP-SAT/MILP/LP),
+  PyNormaliz + normaliz binary (Ehrhart, lattice points), pdfplumber,
+  pypdf, biopython, astropy, rdkit, requests, beautifulsoup4, lxml,
+  scikit-learn, statsmodels, Node 22, git, curl, build-essential.
+
+  Install more with `pip install <pkg>` (resolves to
+  `/opt/conda/bin/pip`). For conda-forge packages: `mamba install -y
+  -n base -c conda-forge <pkg>`.
