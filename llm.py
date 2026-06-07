@@ -962,6 +962,696 @@ def _add_additional_properties(schema):
     return out
 
 
+# ── SDK backends (API-key path) ─────────────────────────────────
+#
+# Direct SDK calls to the Anthropic / OpenAI APIs — no subprocess, no
+# Docker, no Keychain. Code execution and web search run in the
+# providers' own server-side sandboxes.
+#
+# These backends bypass the entire subprocess/docker/watchdog machinery
+# used by the CLI backends. They produce the same artifact shapes and
+# call_log entries, so downstream consumers (harness, grade, show)
+# don't care which path produced a given call.
+
+# In-process session histories for Anthropic. The SDK is stateless, so
+# multi-turn conversations (formalizer repair loop, solver retry) need
+# the client to replay full history. Keyed by a Theoria-generated
+# session_id; persisted to history.json in the per-call artifact dir so
+# `theoria --resume` can reconstruct after a crash.
+_anthropic_sessions: dict[str, dict] = {}
+
+
+def _anthropic_tools(settings: dict) -> list[dict]:
+    """Build the server-side tool list for an Anthropic call."""
+    tools: list[dict] = []
+    if settings.get("search"):
+        tools.append({"type": "web_search_20260209", "name": "web_search"})
+        tools.append({"type": "web_fetch_20260209", "name": "web_fetch"})
+    if settings.get("code_exec"):
+        tools.append({"type": "code_execution_20260120", "name": "code_execution"})
+    return tools
+
+
+def _openai_tools(settings: dict) -> list[dict]:
+    """Build the server-side tool list for an OpenAI Responses call."""
+    tools: list[dict] = []
+    if settings.get("search"):
+        tools.append({"type": "web_search"})
+    if settings.get("code_exec"):
+        tools.append({
+            "type": "code_interpreter",
+            "container": {"type": "auto", "memory_limit": "4g"},
+        })
+    return tools
+
+
+def _normalize_effort(effort: str) -> str:
+    """Map Theoria's legacy `effort: max` to `xhigh`.
+
+    Both providers support both values, but xhigh is the right default
+    for coding/agentic work on the current generation (Opus 4.7,
+    gpt-5.5). `max` is still accepted by the providers, so users who
+    set it explicitly in a config get what they asked for; only the
+    default-named alias gets remapped.
+    """
+    if effort == "max":
+        return "xhigh"
+    return effort
+
+
+def _anthropic_max_tokens(model: str) -> int:
+    """Pick a sensible max_tokens ceiling for the model.
+
+    Opus supports 128K output; Sonnet and Haiku cap at 64K. Streaming
+    is always used (the SDK refuses non-streaming above ~16K), so a
+    large ceiling is free — the model still only generates what it
+    needs.
+    """
+    if "opus" in model.lower():
+        return 128000
+    return 64000
+
+
+# Lazy module-level SDK clients. The SDKs do HTTP connection pooling
+# per-client, so parallel judges benefit from a single shared instance
+# rather than one per call. Imports stay inside the getter so the [api]
+# extra remains optional.
+_anthropic_client = None
+_openai_client = None
+
+
+def _get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None:
+        try:
+            import anthropic
+        except ImportError:
+            raise RuntimeError(
+                "Anthropic backend requested but the `anthropic` package "
+                "isn't installed. Run `pip install -e \".[api]\"` from the "
+                "repo root and try again."
+            )
+        # 30 min timeout covers adaptive thinking + xhigh effort + code
+        # exec on hard problems. The SDK auto-retries 429 / 5xx.
+        _anthropic_client = anthropic.AsyncAnthropic(timeout=30 * 60.0)
+    return _anthropic_client
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        try:
+            from openai import AsyncOpenAI
+        except ImportError:
+            raise RuntimeError(
+                "OpenAI backend requested but the `openai` package isn't "
+                "installed. Run `pip install -e \".[api]\"` from the repo "
+                "root and try again."
+            )
+        _openai_client = AsyncOpenAI(timeout=30 * 60.0)
+    return _openai_client
+
+
+def _serialize_anthropic_content(content) -> list[dict]:
+    """Turn an Anthropic Message.content list (TextBlock / ThinkingBlock /
+    ToolUseBlock / etc.) into plain dicts suitable for the messages API.
+
+    The SDK accepts dict-shaped content blocks on echoed-back assistant
+    turns. Using model_dump() preserves the exact field set the API
+    expects for each block type (tool_use ids, citation envelopes,
+    thinking signatures, etc.).
+    """
+    out = []
+    for block in content:
+        if hasattr(block, "model_dump"):
+            out.append(block.model_dump(exclude_none=True))
+        elif isinstance(block, dict):
+            out.append(block)
+        else:
+            out.append({"type": "text", "text": str(block)})
+    return out
+
+
+def _extract_anthropic_text(content) -> str:
+    """Concatenate all text blocks in an Anthropic response. Schema'd
+    calls put valid JSON in the first text block; non-schema'd calls may
+    interleave text with tool_use blocks — joining preserves the model's
+    final prose."""
+    parts = []
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            parts.append(block.text)
+    return "\n".join(parts)
+
+
+def _extract_anthropic_tool_use(content, *, truncate: bool = True) -> list[dict]:
+    """Extract tool_use blocks from an Anthropic Message for the call
+    log. Matches the shape of _extract_claude_tool_calls but pulls
+    inputs directly from the final Message rather than from the event
+    stream (server-side tools don't surface intermediate events on
+    non-streaming responses)."""
+    out = []
+    for block in content:
+        btype = getattr(block, "type", None)
+        if btype not in ("tool_use", "server_tool_use"):
+            continue
+        out.append({
+            "tool_name": getattr(block, "name", None),
+            "input": _maybe_truncate(
+                getattr(block, "input", None),
+                TOOL_CALL_INPUT_LIMIT, truncate=truncate,
+            ),
+        })
+    return out
+
+
+async def _call_anthropic(
+    prompt: str,
+    role: str,
+    settings: dict,
+    schema: dict | None,
+    system: str | None,
+    resume: str | None,
+    watch: bool,
+    call_dir: str | None,
+) -> tuple[object, str, dict, list, bytes]:
+    """Call the Anthropic Messages API.
+
+    Returns (response, session_id, metadata, events, raw_stdout) —
+    same shape as _run_claude_streaming so the artifact-save path in
+    llm() can handle both uniformly.
+
+    Multi-turn continuity: the SDK is stateless, so a Theoria-generated
+    session_id keys a history dict (mirrored to history.json in the
+    call_dir for crash recovery). On resume the prior history is looked
+    up and the new turn is appended.
+    """
+    client = _get_anthropic_client()
+
+    model = settings.get("model", "claude-opus-4-7")
+    effort = _normalize_effort(settings.get("effort", "xhigh"))
+
+    # Restore prior history on resume — first from memory, then from
+    # the on-disk history.json a prior cache-hit may have left behind.
+    container_id: str | None = None
+    if resume and resume in _anthropic_sessions:
+        sess = _anthropic_sessions[resume]
+        messages = list(sess["messages"])
+        container_id = sess.get("container_id")
+        session_id = resume
+    elif resume:
+        # Stale in-memory dict (e.g. after --resume into a fresh
+        # process). Loud failure here would break repair loops; start
+        # a fresh session and let the caller's prior context get
+        # replayed via prompt content instead.
+        print(
+            f"[anthropic] warning: resume={resume[:16]}... requested but "
+            f"no in-memory history. Starting a fresh session.",
+            file=sys.stderr,
+        )
+        messages = []
+        session_id = f"anthropic_{uuid.uuid4().hex}"
+    else:
+        messages = []
+        session_id = f"anthropic_{uuid.uuid4().hex}"
+
+    messages.append({"role": "user", "content": prompt})
+
+    tools = _anthropic_tools(settings)
+
+    output_config: dict = {"effort": effort}
+    if schema:
+        output_config["format"] = {"type": "json_schema", "schema": schema}
+
+    kwargs: dict = {
+        "model": model,
+        # Streaming is always used below, so a high ceiling is free —
+        # the model still only generates what it needs. 128K for Opus
+        # (the documented cap), 64K for Sonnet/Haiku.
+        "max_tokens": _anthropic_max_tokens(model),
+        "messages": messages,
+        "output_config": output_config,
+    }
+    if system:
+        # Cache the system prefix across calls in the same session
+        # (formalizer repair loop is the big winner here). Harmless
+        # if the prompt is below the ~1024-token cacheable minimum —
+        # the SDK just doesn't write the cache.
+        kwargs["system"] = [{
+            "type": "text", "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }]
+    if settings.get("thinking") == "adaptive":
+        kwargs["thinking"] = {"type": "adaptive"}
+    if tools:
+        kwargs["tools"] = tools
+    if container_id:
+        # Reuse the code-execution container across resume calls so
+        # Python state (variables, installed packages, files) persists.
+        kwargs["container"] = container_id
+
+    # Streaming is always used — both because the SDK's accumulator
+    # (`get_final_message`) only fills in as the event loop is
+    # iterated, and because `max_tokens` is high enough that
+    # non-streaming would risk SDK HTTP timeouts. `watch` only
+    # controls whether events get printed to stderr along the way.
+    #
+    # Server-side tools (web_search, code_execution) auto-loop on the
+    # server up to ~10 iterations and then return stop_reason=pause_turn
+    # if not done. The documented continuation pattern is to re-send
+    # with the assistant turn appended; PAUSE_MAX bounds the loop in
+    # case something goes pathological.
+    final_message = None
+    pause_continuations = 0
+    PAUSE_MAX = 5
+    while True:
+        async with client.messages.stream(**kwargs) as stream:
+            async for event in stream:
+                if not watch:
+                    continue
+                if event.type == "content_block_start":
+                    block = event.content_block
+                    btype = getattr(block, "type", None)
+                    if btype in ("tool_use", "server_tool_use"):
+                        print(
+                            f"      [tool] {getattr(block, 'name', '?')}",
+                            file=sys.stderr,
+                        )
+                    elif btype == "thinking":
+                        print("      [thinking...]", file=sys.stderr)
+            final_message = await stream.get_final_message()
+
+        if final_message.stop_reason != "pause_turn":
+            break
+        if pause_continuations >= PAUSE_MAX:
+            raise RuntimeError(
+                f"anthropic pause_turn loop did not converge after "
+                f"{PAUSE_MAX} continuations"
+            )
+        # Per docs: re-send messages with the assistant turn appended.
+        # The server detects the trailing server_tool_use and resumes.
+        kwargs["messages"] = messages + [
+            {"role": "assistant",
+             "content": _serialize_anthropic_content(final_message.content)},
+        ]
+        pause_continuations += 1
+
+    full_text = _extract_anthropic_text(final_message.content)
+
+    if schema:
+        try:
+            response = json.loads(full_text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"anthropic returned non-JSON for a schema'd call "
+                f"(stop_reason={final_message.stop_reason!r}). "
+                f"text={full_text[:500]!r} error={e}"
+            )
+    else:
+        response = full_text
+    response = _sanitize_llm_output(response)
+
+    # Echo the assistant turn back into the history dict so the next
+    # resume call has it. Serializing via model_dump rather than
+    # storing the raw content blocks is intentional — the API accepts
+    # dict-shaped blocks on echo-back, and dicts also serialize cleanly
+    # to history.json below.
+    messages.append({
+        "role": "assistant",
+        "content": _serialize_anthropic_content(final_message.content),
+    })
+    new_container = getattr(final_message, "container", None)
+    new_container_id = getattr(new_container, "id", None) if new_container else None
+    _anthropic_sessions[session_id] = {
+        "messages": messages,
+        "container_id": new_container_id or container_id,
+    }
+    # Mirror to disk so `theoria --resume` can rebuild the in-memory
+    # dict after the process restarts.
+    if call_dir is not None:
+        try:
+            with open(os.path.join(call_dir, "history.json"), "w") as f:
+                json.dump(_anthropic_sessions[session_id], f, default=str)
+        except OSError:
+            pass  # artifact failure shouldn't break the call
+
+    usage = final_message.usage
+    metadata = {
+        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        "stop_reason": final_message.stop_reason,
+        # total_cost_usd: Anthropic SDK doesn't expose per-call cost on
+        # the Message object; downstream metrics treat None as "unknown".
+        "total_cost_usd": None,
+        "tool_calls": _extract_anthropic_tool_use(final_message.content),
+    }
+
+    events = [final_message.model_dump(exclude_none=True)]
+    raw_stdout = json.dumps(events[0], default=str).encode("utf-8")
+
+    return response, session_id, metadata, events, raw_stdout
+
+
+async def _call_openai(
+    prompt: str,
+    role: str,
+    settings: dict,
+    schema: dict | None,
+    system: str | None,
+    resume: str | None,
+    watch: bool,
+    call_dir: str | None,
+) -> tuple[object, str, dict, list, bytes]:
+    """Call the OpenAI Responses API.
+
+    Multi-turn continuity uses native previous_response_id — no
+    client-side history tracking needed. store=True is required for
+    previous_response_id to work; it gets set unconditionally.
+
+    Returns (response, session_id, metadata, events, raw_stdout) —
+    same shape as _run_codex_streaming.
+    """
+    client = _get_openai_client()
+
+    model = settings.get("model", "gpt-5.5")
+    effort = _normalize_effort(settings.get("effort", "xhigh"))
+
+    kwargs: dict = {
+        "model": model,
+        "input": prompt,
+        "reasoning": {"effort": effort},
+        "store": True,
+    }
+    if system:
+        # `instructions` is the documented top-level system-prompt
+        # parameter on the Responses API. Unlike a developer message
+        # in `input`, it's NOT carried by previous_response_id — so
+        # it gets resent on every call (including resumes) to keep
+        # behavior stable across the turn.
+        kwargs["instructions"] = system
+    if resume:
+        kwargs["previous_response_id"] = resume
+
+    if schema:
+        # OpenAI strict JSON schemas require `additionalProperties: false`
+        # on every object — the same helper the codex CLI path already
+        # uses to satisfy this.
+        oai_schema = _add_additional_properties(schema)
+        kwargs["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "response",
+                "strict": True,
+                "schema": oai_schema,
+            }
+        }
+
+    tools = _openai_tools(settings)
+    if tools:
+        kwargs["tools"] = tools
+
+    if watch:
+        # Single hint that a call is in flight — the Responses API
+        # streaming surface wasn't well-documented at the time this
+        # was written, so the non-streaming create() is used here and
+        # per-event progress is skipped. The full response still gets
+        # saved to events.json.gz for post-hoc inspection.
+        print(f"      [openai {model} working...]", file=sys.stderr)
+    final_response = await client.responses.create(**kwargs)
+
+    text = final_response.output_text or ""
+
+    if schema:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"openai returned non-JSON for a schema'd call "
+                f"(status={getattr(final_response, 'status', '?')!r}). "
+                f"text={text[:500]!r} error={e}"
+            )
+        result = _sanitize_llm_output(data)
+    else:
+        result = _sanitize_llm_output(text)
+
+    session_id = final_response.id
+
+    # cached_tokens may live under either input_tokens_details or
+    # prompt_tokens_details depending on SDK version — try both.
+    usage = getattr(final_response, "usage", None)
+    cached_tokens = 0
+    if usage is not None:
+        for attr in ("input_tokens_details", "prompt_tokens_details"):
+            details = getattr(usage, attr, None)
+            if details is not None:
+                cached_tokens = getattr(details, "cached_tokens", 0) or 0
+                if cached_tokens:
+                    break
+    metadata = {
+        "input_tokens": getattr(usage, "input_tokens", 0) if usage else 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) if usage else 0,
+        "cached_input_tokens": cached_tokens,
+        # OpenAI doesn't expose per-call cost on the response; downstream
+        # summarization treats None as "unknown" and skips cost roll-up.
+        "total_cost_usd": None,
+        "tool_calls": _extract_openai_tool_calls(final_response),
+    }
+
+    events = [final_response.model_dump(exclude_none=True)]
+    raw_stdout = json.dumps(events[0], default=str).encode("utf-8")
+
+    return result, session_id, metadata, events, raw_stdout
+
+
+def _extract_openai_tool_calls(response, *, truncate: bool = True) -> list[dict]:
+    """Pull tool invocations out of a Responses API result.
+
+    The Responses API returns one item per built-in tool call in
+    response.output, with type discriminators like 'web_search_call' and
+    'code_interpreter_call'. The shape varies per tool; the per-call
+    entry captures just enough for post-hoc inspection without bloating
+    the call log.
+    """
+    out = []
+    items = getattr(response, "output", None) or []
+    for item in items:
+        itype = getattr(item, "type", None)
+        if itype not in ("web_search_call", "code_interpreter_call", "function_call"):
+            continue
+        tool_name = itype.replace("_call", "")
+        # Each tool surfaces its inputs under a different attribute —
+        # web_search_call has `action` (with `query`), code_interpreter_call
+        # has `code`, function_call has `arguments`. Best-effort capture.
+        action = getattr(item, "action", None)
+        if action is not None and hasattr(action, "model_dump"):
+            action = action.model_dump(exclude_none=True)
+        code = getattr(item, "code", None)
+        arguments = getattr(item, "arguments", None)
+        payload = action if action is not None else (code or arguments)
+        out.append({
+            "tool_name": tool_name,
+            "input": _maybe_truncate(payload, TOOL_CALL_INPUT_LIMIT, truncate=truncate),
+        })
+    return out
+
+
+async def _call_sdk_backend(
+    prompt: str,
+    role: str,
+    backend: str,
+    settings: dict,
+    schema: dict | None,
+    system: str | None,
+    resume: str | None,
+    watch: bool,
+) -> tuple[str | dict, str | None]:
+    """Run an SDK-backed LLM call with the same artifact + call_log
+    shape the subprocess backends produce. Handles cache resume,
+    pre/post-call artifact writes, and call_log slotting.
+    """
+    # ── Reserve a call_log slot (matches subprocess path) ────────
+    log = call_log.get()
+    if log is None:
+        call_index = None
+    else:
+        call_index = len(log)
+        log.append(None)
+
+    base_artifact_dir = artifact_dir.get()
+    call_dir: str | None = None
+    if base_artifact_dir is not None and call_index is not None:
+        call_dir = os.path.join(
+            base_artifact_dir, f"call_{call_index:03d}_{role}",
+        )
+        os.makedirs(call_dir, exist_ok=True)
+
+    # ── Cache resume (idempotent) ────────────────────────────────
+    if call_dir is not None:
+        cached = _try_resume_from_cache(call_dir, prompt, system, schema)
+        if cached is not None:
+            response, session_id, cache_meta = cached
+            # Restore Anthropic session history from disk so subsequent
+            # live calls can resume properly after a Theoria --resume.
+            if backend == "anthropic" and session_id:
+                history_path = os.path.join(call_dir, "history.json")
+                if os.path.exists(history_path):
+                    try:
+                        with open(history_path) as f:
+                            _anthropic_sessions[session_id] = json.load(f)
+                    except (OSError, json.JSONDecodeError):
+                        pass  # next live call will warn
+            print(
+                f"[resume] cache hit on call_{call_index:03d}_{role}",
+                file=sys.stderr,
+            )
+            if log is not None and call_index is not None:
+                log[call_index] = cache_meta
+            return response, session_id
+
+    # ── Pre-call artifacts ───────────────────────────────────────
+    # "cmd" here is the API call params (not an argv list) — close
+    # analog of the subprocess cmd.json for post-hoc inspection.
+    cmd_dict = {
+        "backend": backend,
+        "role": role,
+        "model": settings.get("model"),
+        "effort": settings.get("effort"),
+        "schema": bool(schema),
+        "tools": {
+            "search": bool(settings.get("search")),
+            "code_exec": bool(settings.get("code_exec")),
+        },
+        "resume": bool(resume),
+        "watch": watch,
+    }
+    if call_dir:
+        _write_artifact(
+            os.path.join(call_dir, "cmd.json"),
+            json.dumps(cmd_dict, indent=2, ensure_ascii=False),
+        )
+        _write_artifact(os.path.join(call_dir, "prompt.txt"), prompt)
+        if system:
+            _write_artifact(os.path.join(call_dir, "system.txt"), system)
+
+    # ── Call ─────────────────────────────────────────────────────
+    started_at = _utc_now_iso()
+    started = time.perf_counter()
+    raw_stdout = b""
+    events: list[dict] = []
+    try:
+        if backend == "anthropic":
+            response, session_id, provider_meta, events, raw_stdout = \
+                await _call_anthropic(
+                    prompt, role, settings, schema, system, resume,
+                    watch, call_dir,
+                )
+        else:  # openai
+            response, session_id, provider_meta, events, raw_stdout = \
+                await _call_openai(
+                    prompt, role, settings, schema, system, resume,
+                    watch, call_dir,
+                )
+    except Exception as e:
+        # Failure path — write a meta.json so the call_dir is
+        # self-describing for post-mortem.
+        if call_dir:
+            try:
+                _write_artifact(
+                    os.path.join(call_dir, "meta.json"),
+                    json.dumps({
+                        "role": role,
+                        "backend": backend,
+                        "model": settings.get("model"),
+                        "effort": settings.get("effort"),
+                        "cmd": cmd_dict,
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                        "failed": True,
+                    }, indent=2, default=str),
+                )
+            except Exception:
+                pass
+        raise
+
+    duration_ms = int(round((time.perf_counter() - started) * 1000))
+
+    # ── Post-call artifacts ──────────────────────────────────────
+    artifact_paths: dict[str, str] = {}
+    if call_dir:
+        response_text = response if isinstance(response, str) else json.dumps(response, indent=2)
+        artifact_paths["artifact_dir"] = call_dir
+        artifact_paths["cmd_path"] = os.path.join(call_dir, "cmd.json")
+        artifact_paths["prompt_path"] = os.path.join(call_dir, "prompt.txt")
+        if system:
+            artifact_paths["system_path"] = os.path.join(call_dir, "system.txt")
+        if raw_stdout:
+            _write_artifact(
+                os.path.join(call_dir, "stdout.jsonl"),
+                raw_stdout, gzip_it=True,
+            )
+            artifact_paths["stdout_path"] = os.path.join(call_dir, "stdout.jsonl.gz")
+        _write_artifact(
+            os.path.join(call_dir, "response.txt"), response_text,
+        )
+        artifact_paths["response_path"] = os.path.join(call_dir, "response.txt")
+        if events:
+            _write_artifact(
+                os.path.join(call_dir, "events.json"),
+                json.dumps(events, ensure_ascii=False, default=str),
+                gzip_it=True,
+            )
+            artifact_paths["events_path"] = os.path.join(call_dir, "events.json.gz")
+        if provider_meta.get("tool_calls"):
+            _write_artifact(
+                os.path.join(call_dir, "tool_calls.json"),
+                json.dumps(provider_meta["tool_calls"], ensure_ascii=False,
+                           indent=2, default=str),
+            )
+            artifact_paths["tool_calls_path"] = os.path.join(call_dir, "tool_calls.json")
+
+    # ── call_log entry ───────────────────────────────────────────
+    call_meta = None
+    if log is not None:
+        response_text = response if isinstance(response, str) else json.dumps(response)
+        call_meta = {
+            "role": role,
+            "backend": backend,
+            "model": settings.get("model"),
+            "model_config": settings.get("model"),
+            "effort": settings.get("effort"),
+            "started_at": started_at,
+            "ended_at": _utc_now_iso(),
+            "duration_ms": duration_ms,
+            "session_id": session_id,
+            "resumed": bool(resume),
+            "has_schema": schema is not None,
+            "returncode": 0,
+            "argv_hash": hashlib.sha256(
+                json.dumps(cmd_dict, sort_keys=True).encode()
+            ).hexdigest()[:16],
+            "sandboxed": False,  # API path uses provider's sandbox
+            "container_id": None,
+            "container_cwd": None,
+            "image_id": None,
+            "prompt": _truncate(prompt, 8000),
+            "system": _truncate(system or "", 8000),
+            "response": _truncate(response_text, 8000),
+            **artifact_paths,
+            **provider_meta,
+        }
+        log[call_index] = call_meta
+
+    if call_dir and call_meta is not None:
+        _write_artifact(
+            os.path.join(call_dir, "meta.json"),
+            json.dumps(call_meta, indent=2, default=str),
+        )
+
+    return response, session_id
+
+
 # ── Main entry point ────────────────────────────────────────────
 
 async def llm(
@@ -1008,6 +1698,20 @@ async def llm(
     elif backend == "claude":
         settings.setdefault("model", "opus")
         settings.setdefault("effort", "max")
+    elif backend == "anthropic":
+        settings.setdefault("model", "claude-opus-4-7")
+        settings.setdefault("effort", "xhigh")
+    elif backend == "openai":
+        settings.setdefault("model", "gpt-5.5")
+        settings.setdefault("effort", "xhigh")
+
+    # SDK backends bypass the entire subprocess/docker/watchdog
+    # machinery. They produce the same artifact format and call_log
+    # entries so downstream consumers don't care which path ran.
+    if backend in ("anthropic", "openai"):
+        return await _call_sdk_backend(
+            prompt, role, backend, settings, schema, system, resume, watch,
+        )
 
     # ── Reserve a slot in the call log ───────────────────────────
     #

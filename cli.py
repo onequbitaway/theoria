@@ -41,6 +41,11 @@ import sandbox
 STD_IMAGE = "theoria-sandbox:latest"
 SAGE_IMAGE = "theoria-sandbox-sage:latest"
 
+# Optional API-key preset — stacks per-role backend overrides that route
+# every call through the official Anthropic/OpenAI SDKs instead of the
+# claude/codex CLIs. Selected by --api on any run command.
+API_CONFIG_PATH = str(Path(__file__).parent / "configs" / "api.yaml")
+
 
 # ── Shared run options ────────────────────────────────────────────
 
@@ -82,11 +87,47 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
         "--resume", default=None, metavar="RUN_ID",
         help="Resume an existing run by id (reuses cached per-call results).",
     )
+    g.add_argument(
+        "--api", action="store_true",
+        help="API-key mode: route every role through the official "
+             "Anthropic/OpenAI SDKs (any OS, no Docker, no subscription). "
+             "Requires ANTHROPIC_API_KEY + OPENAI_API_KEY and the optional "
+             "[api] install. NOT the audited HLE configuration — results "
+             "may differ from the published numbers.",
+    )
 
 
 def _resolve(args) -> None:
     """Apply the audited HLE setup, letting the remaining knobs (--image /
-    --no-docker / --config / ...) override, then hand off to the harness."""
+    --no-docker / --config / ...) override, then hand off to the harness.
+
+    --api opts into the API-key path: stacks configs/api.yaml (per-role
+    backend mapping), forces Docker off (provider-side sandbox replaces
+    local Docker), and skips the global backend override so api.yaml's
+    per-role assignments survive.
+    """
+    api_mode = getattr(args, "api", False)
+
+    if api_mode:
+        # API mode uses the provider's server-side sandbox; local
+        # Docker has no role to play. Reject the combination loudly
+        # rather than silently dropping one flag.
+        if args.docker is True:
+            sys.exit("--api and --docker are mutually exclusive "
+                     "(API mode uses the provider's server-side sandbox).")
+        # Stack api.yaml after any user-supplied configs so it wins on
+        # the per-role backend assignments. apply_args will then skip
+        # the global backend override — args.backend = None signals it
+        # to leave per-role backends from the config alone.
+        configs = list(args.config or [])
+        configs.append(API_CONFIG_PATH)
+        args.config = configs
+        args.backend = None
+        args.docker = False
+        args.image = None    # ignored when docker is off
+        harness.apply_args(args)
+        return
+
     # The audited configuration is the only one: Codex on every role except
     # the formalizer, which apply_args pins to Claude.
     #
@@ -292,10 +333,50 @@ def cmd_doctor(args) -> None:
     if sys.platform != "darwin":
         print("\n  ! Note: the subscription auth path extracts Claude "
               "credentials from the macOS Keychain, so it currently "
-              "requires macOS.")
+              "requires macOS. The API-key path below works on any OS.")
 
-    print("\n" + ("All set — try `theoria hle 1`  or  `theoria custom \"What is 2+2?\"`."
-                  if ok else "Some checks failed (see hints above)."))
+    # ── API-key mode (optional alternative to subscription) ──────
+    print("\nAPI-key mode (optional — `theoria hle 1 --api`):")
+    import os as _os
+    api_ok = True
+
+    def api_check(label, passed, hint=""):
+        nonlocal api_ok
+        mark = "✓" if passed else "·"
+        print(f"  {mark} {label}")
+        if not passed:
+            api_ok = False
+            if hint:
+                print(f"      → {hint}")
+
+    try:
+        import anthropic  # noqa: F401
+        api_check("anthropic SDK installed", True)
+    except ImportError:
+        api_check("anthropic SDK installed", False,
+                  "pip install -e \".[api]\"  (adds anthropic + openai)")
+    try:
+        import openai  # noqa: F401
+        api_check("openai SDK installed", True)
+    except ImportError:
+        api_check("openai SDK installed", False,
+                  "pip install -e \".[api]\"  (adds anthropic + openai)")
+    api_check("ANTHROPIC_API_KEY set",
+              bool(_os.environ.get("ANTHROPIC_API_KEY")),
+              "export ANTHROPIC_API_KEY=sk-ant-...  (formalizer needs it)")
+    api_check("OPENAI_API_KEY set",
+              bool(_os.environ.get("OPENAI_API_KEY")),
+              "export OPENAI_API_KEY=sk-...  (solver + judges need it)")
+    if api_ok:
+        print("    (API-key mode ready — try `theoria hle 1 --api`)")
+    else:
+        print("    (API-key mode incomplete — fix the above to use --api)")
+
+    # API-mode failures are independent of the main subscription path —
+    # don't flip overall exit code on them.
+    print("\n" + ("Subscription path ready — try `theoria hle 1`  or  "
+                  "`theoria custom \"What is 2+2?\"`."
+                  if ok else "Subscription-path checks failed (see hints above)."))
     sys.exit(0 if ok else 1)
 
 

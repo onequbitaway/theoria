@@ -40,9 +40,29 @@ Both are required: every run uses Codex for the solver/judges and Claude for the
 - **Docker** — each problem runs in its own hardened container.
 - **Python ≥ 3.12** and **macOS.**
 
-> **Why macOS (for now):** Theoria mounts your Claude subscription credentials into the sandbox by reading them from the macOS Keychain. The Codex side is a plain `~/.codex` bind-mount and is cross-platform, but the formalizer needs Claude, so macOS is currently required end-to-end. An API-key path (any OS, no subscription) is the next planned addition.
+> **Why macOS (for now):** the subscription path mounts your Claude credentials into the sandbox by reading them from the macOS Keychain. The Codex side is a plain `~/.codex` bind-mount and is cross-platform, but the formalizer needs Claude, so macOS is currently required for the subscription path end-to-end. **The API-key path below works on any OS** and skips Docker entirely.
 
-Running Theoria costs nothing beyond your existing Claude/Codex subscriptions — there are no API keys or per-call charges.
+Running Theoria on the subscription path costs nothing beyond your existing Claude/Codex subscriptions — there are no API keys or per-call charges.
+
+---
+
+## API-key mode (any OS, no subscription)
+
+Skip the CLIs, the Keychain, and Docker — call the Anthropic and OpenAI APIs directly. Works on Linux, Windows, and macOS.
+
+```bash
+pip install -e ".[api]"               # adds the official SDKs
+export ANTHROPIC_API_KEY=sk-ant-...   # formalizer (always Anthropic)
+export OPENAI_API_KEY=sk-...          # solver + judges
+theoria doctor                        # confirms both keys + SDKs
+theoria hle 1 --api                   # API-key run
+```
+
+What `--api` does: stacks [`configs/api.yaml`](configs/api.yaml) which routes the formalizer to Anthropic (Opus 4.7, adaptive thinking, `xhigh` effort) and every other role — solver, judges, pedantry, convention lift — to OpenAI (`gpt-5.5`, `xhigh` reasoning). Web search and code execution use each provider's server-side sandbox; no local Docker container is started.
+
+> **Not the audited HLE configuration.** The 88% / 99% / 57% numbers in the intro come from the subscription path with `--docker` + the Sage image. The API-key path uses the same prompts and pipeline but different model endpoints and a different code-execution sandbox, so results may differ. Grade with `theoria grade` to compare runs head-to-head.
+
+`--api` is mutually exclusive with `--docker`. Override the per-role mapping with your own `--config some.yaml` stacked on top.
 
 ---
 

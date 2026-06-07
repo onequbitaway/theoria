@@ -9,6 +9,14 @@ dependencies = [
     "datasets>=4.0",
 ]
 
+# `pip install -e ".[api]"` adds the API-key backends (any OS, no subscription
+# / Docker / Keychain). Base install keeps the CLI/subscription path slim.
+[project.optional-dependencies]
+api = [
+    "anthropic>=0.50",
+    "openai>=1.50",
+]
+
 [project.scripts]
 theoria = "cli:main"
 

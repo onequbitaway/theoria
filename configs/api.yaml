@@ -1,0 +1,73 @@
+# API-key preset — mirrors the audited mapping (Claude on formalizer, OpenAI
+# on everything else) but routes through the official SDKs instead of the
+# Claude / Codex CLIs. Stack with `theoria hle 1 --api`.
+#
+# Differences from the audited CLI configuration:
+#   - No local Docker. Code execution runs in the provider's sandbox
+#     (Anthropic code_execution_20260120 / OpenAI code_interpreter).
+#   - No subscription credentials. Reads ANTHROPIC_API_KEY + OPENAI_API_KEY.
+#   - Runs on any OS, not just macOS.
+#
+# This is NOT the audited HLE configuration — results may differ from the
+# numbers reported in the README. Use `theoria grade` to compare runs.
+#
+# Per-role flags:
+#   backend: anthropic|openai     — which SDK
+#   model: <provider model id>     — overridable by user
+#   effort: low|medium|high|xhigh|max  — reasoning depth
+#   search: true                   — enable web search server-side tool
+#   code_exec: true                — enable code execution server-side tool
+#   thinking: adaptive             — Anthropic only; required on Opus 4.7
+
+solver:
+  backend: openai
+  model: gpt-5.5
+  effort: xhigh
+  search: true
+  code_exec: true
+
+formalizer:
+  backend: anthropic
+  model: claude-opus-4-7
+  effort: xhigh
+  thinking: adaptive
+  code_exec: true
+  # Web search not enabled — the formalizer should be reasoning about an
+  # already-produced solution, not re-researching the problem.
+
+citation:
+  backend: openai
+  model: gpt-5.5
+  effort: xhigh
+  search: true
+
+problem_given:
+  backend: openai
+  model: gpt-5.5
+  effort: xhigh
+  # No search — this judge checks the proof step against the problem text;
+  # web search would only introduce noise.
+
+computation:
+  backend: openai
+  model: gpt-5.5
+  effort: xhigh
+  search: true
+
+initial_state:
+  backend: openai
+  model: gpt-5.5
+  effort: xhigh
+  search: true
+
+pedantry:
+  backend: openai
+  model: gpt-5.5
+  effort: xhigh
+  search: true
+
+convention_lift:
+  backend: openai
+  model: gpt-5.5
+  effort: xhigh
+  search: true
